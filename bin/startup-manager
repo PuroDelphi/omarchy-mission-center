@@ -1,0 +1,332 @@
+#!/bin/bash
+# startup-manager — gestor de programas de arranque para Omarchy.
+# Fuentes: servicios systemd de usuario · autostart XDG · ~/.config/hypr/autostart.lua
+#
+# Uso:
+#   startup-manager            TUI interactiva (fzf)
+#   startup-manager --list     Volcar las entradas detectadas (sin TUI)
+
+set -u
+PATH="/usr/share/omarchy/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
+
+AUTO_DIR="$HOME/.config/autostart"
+SYS_AUTO_DIR="/etc/xdg/autostart"
+LUA_FILE="$HOME/.config/hypr/autostart.lua"
+# Servicios que solo se desactivan con confirmación (rompen la sesión/audio).
+DENY="pipewire.service pipewire-pulse.service wireplumber.service dbus-broker.service"
+
+MSG=""
+
+sanitize() { tr '\n\t|' '  -' <<<"$1"; }
+
+desktop_name() {
+  local n
+  n=$(grep -m1 '^Name=' "$1" 2>/dev/null | cut -d= -f2-)
+  [[ -z $n ]] && n=$(basename "$1" .desktop)
+  printf '%s' "$n"
+}
+
+desktop_hidden() { grep -qi '^Hidden=true' "$1" 2>/dev/null; }
+
+xdg_eff_file() {
+  if [[ -e "$AUTO_DIR/$1" ]]; then printf '%s' "$AUTO_DIR/$1"
+  elif [[ -e "$SYS_AUTO_DIR/$1" ]]; then printf '%s' "$SYS_AUTO_DIR/$1"
+  fi
+}
+
+xdg_eff_enabled() {
+  local eff
+  eff=$(xdg_eff_file "$1")
+  [[ -n $eff ]] && ! desktop_hidden "$eff"
+}
+
+xdg_unit() { # $1 = basename .desktop → unidad autostart generada
+  local id=${1%.desktop}
+  printf 'app-%s@autostart.service' "$(printf '%s' "$id" | sed 's/-/\\x2d/g')"
+}
+
+gen_records() {
+  local idx=0 u l a sub unit state e base eff name line n cmd
+  local -A ACTIVE=()
+
+  while read -r u l a sub _; do
+    ACTIVE[$u]=$a
+  done < <(systemctl --user list-units --all --plain --no-legend --type=service 2>/dev/null)
+
+  # Servicios systemd de usuario
+  while read -r unit state _; do
+    [[ $state == enabled || $state == disabled ]] || continue
+    [[ $unit == *@* ]] && continue
+    if [[ ${ACTIVE[$unit]:-} == active ]]; then e="● corriendo"
+    elif [[ $state == enabled ]]; then e="● activado"
+    else e="○ desactivado"; fi
+    idx=$((idx + 1))
+    printf '%s|%s|systemd|%s|%s\n' "$idx" "$e" "$(sanitize "$unit")" "$unit"
+  done < <(systemctl --user list-unit-files --type=service --no-legend 2>/dev/null)
+
+  # Autostart XDG (el archivo del usuario anula al del sistema)
+  local -A SEEN=()
+  for base in "$AUTO_DIR"/*.desktop "$SYS_AUTO_DIR"/*.desktop; do
+    [[ -e $base ]] || continue
+    base=$(basename "$base")
+    [[ -n ${SEEN[$base]:-} ]] && continue
+    SEEN[$base]=1
+    eff=$(xdg_eff_file "$base")
+    [[ -n $eff ]] || continue
+    name=$(desktop_name "$eff")
+    if desktop_hidden "$eff"; then e="○ desactivado"
+    elif [[ ${ACTIVE[$(xdg_unit "$base")]:-} == active ]]; then e="● corriendo"
+    else e="○ activado"; fi
+    idx=$((idx + 1))
+    printf '%s|%s|xdg|%s|%s\n' "$idx" "$e" "$(sanitize "$name")" "$base"
+  done
+
+  # ~/.config/hypr/autostart.lua
+  if [[ -f $LUA_FILE ]]; then
+    n=0
+    while IFS= read -r line || [[ -n $line ]]; do
+      n=$((n + 1))
+      [[ $line =~ o\.(launch|exec)_on_start\( ]] || continue
+      [[ $line =~ \"([^\"]*)\" ]] || continue
+      if [[ ${line#"${line%%[![:space:]]*}"} == --* ]]; then e="○ desactivado"
+      else e="● activado"; fi
+      idx=$((idx + 1))
+      printf '%s|%s|lua|%s|%s:%s\n' "$idx" "$e" "$(sanitize "${BASH_REMATCH[1]}")" "$LUA_FILE" "$n"
+    done < "$LUA_FILE"
+  fi
+}
+
+xdg_apply() { # $1 = basename .desktop
+  local unit
+  unit=$(xdg_unit "$1")
+  systemctl --user daemon-reload 2>/dev/null
+  if xdg_eff_enabled "$1"; then
+    if ! systemctl --user start "$unit" 2>/dev/null; then
+      MSG="$MSG · se aplicará en el próximo inicio de sesión"
+    fi
+  else
+    systemctl --user stop "$unit" 2>/dev/null
+  fi
+}
+
+xdg_set_hidden() { # $1 = archivo, $2 = true|false
+  if grep -qi '^Hidden=' "$1"; then
+    sed -i "s/^Hidden=.*/Hidden=$2/" "$1"
+  else
+    printf 'Hidden=%s\n' "$2" >>"$1"
+  fi
+}
+
+xdg_toggle() { # $1 = basename .desktop
+  local base="$1" userf="$AUTO_DIR/$1" sysf="$SYS_AUTO_DIR/$1"
+  if [[ -e $userf ]]; then
+    if desktop_hidden "$userf"; then
+      if [[ -e $sysf ]]; then
+        rm -f "$userf"
+        MSG="Activado (entrada del sistema restaurada): $base"
+      else
+        xdg_set_hidden "$userf" false
+        MSG="Activado: $base"
+      fi
+    else
+      xdg_set_hidden "$userf" true
+      MSG="Desactivado: $base"
+    fi
+  elif [[ -e $sysf ]]; then
+    cp "$sysf" "$userf"
+    xdg_set_hidden "$userf" true
+    MSG="Desactivado (anulado en usuario): $base"
+  else
+    MSG="No existe $base"
+    return
+  fi
+  xdg_apply "$base"
+}
+
+action_toggle() { # $1 = estado, $2 = fuente, $3 = clave
+  local estado="$1" fuente="$2" clave="$3" out a f n line
+  case "$fuente" in
+  systemd)
+    if [[ $estado != *desactivado* && " $DENY " == *" $clave "* ]]; then
+      read -r -p "¿$clave es crítico para la sesión. Desactivarlo? (s/N) " a
+      [[ $a == [sS] ]] || { MSG="Cancelado"; return; }
+    fi
+    if [[ $estado == *desactivado* ]]; then
+      if out=$(systemctl --user enable --now "$clave" 2>&1); then MSG="Activado: $clave"
+      else MSG="Error: ${out##*$'\n'}"; fi
+    else
+      if out=$(systemctl --user disable --now "$clave" 2>&1); then MSG="Desactivado: $clave"
+      else MSG="Error: ${out##*$'\n'}"; fi
+    fi
+    ;;
+  xdg) xdg_toggle "$clave" ;;
+  lua)
+    f=${clave%:*}
+    n=${clave##*:}
+    line=$(sed -n "${n}p" "$f")
+    if [[ $line =~ ^[[:space:]]*--[[:space:]] ]]; then
+      sed -i "${n}s/^[[:space:]]*--[[:space:]]*//" "$f"
+      MSG="Activada la línea $n de autostart.lua"
+    else
+      sed -i "${n}s/^/-- /" "$f"
+      MSG="Comentada la línea $n de autostart.lua"
+    fi
+    ;;
+  esac
+}
+
+action_run() { # $1 = fuente, $2 = clave
+  local fuente="$1" clave="$2" out eff exec_line f n line typ cmd
+  case "$fuente" in
+  systemd)
+    if out=$(systemctl --user restart "$clave" 2>&1); then MSG="Ejecutado: $clave"
+    else MSG="Error: ${out##*$'\n'}"; fi
+    ;;
+  xdg)
+    eff=$(xdg_eff_file "$clave")
+    [[ -n $eff ]] || { MSG="No existe $clave"; return; }
+    exec_line=$(grep -m1 '^Exec=' "$eff" | cut -d= -f2-)
+    exec_line=$(sed -E 's/[[:space:]]+%[fFuUdDnNickvm]//g; s/[[:space:]]+%%//g' <<<"$exec_line")
+    [[ -n $exec_line ]] || { MSG="Sin Exec en $clave"; return; }
+    setsid uwsm-app -- sh -c "$exec_line" >/dev/null 2>&1 &
+    MSG="Ejecutando: $exec_line"
+    ;;
+  lua)
+    f=${clave%:*}
+    n=${clave##*:}
+    line=$(sed -n "${n}p" "$f")
+    sed -E 's/^[[:space:]]*--[[:space:]]*//' <<<"$line" | grep -q . || { MSG="Línea vacía"; return; }
+    line=$(sed -E 's/^[[:space:]]*--[[:space:]]*//' <<<"$line")
+    if [[ $line =~ o\.(launch|exec)_on_start\(\"([^\"]*)\" ]]; then
+      typ=${BASH_REMATCH[1]}
+      cmd=${BASH_REMATCH[2]}
+      if [[ $typ == launch ]]; then
+        setsid uwsm-app -- sh -c "$cmd" >/dev/null 2>&1 &
+      else
+        setsid sh -c "$cmd" >/dev/null 2>&1 &
+      fi
+      MSG="Ejecutando: $cmd"
+    else
+      MSG="No reconozco la línea $n"
+    fi
+    ;;
+  esac
+}
+
+action_edit() { # $1 = fuente, $2 = clave
+  local fuente="$1" clave="$2" path userf="$AUTO_DIR/$clave" sysf="$SYS_AUTO_DIR/$clave"
+  case "$fuente" in
+  systemd)
+    path=$(systemctl --user show -p FragmentPath --value "$clave" 2>/dev/null)
+    if [[ $path == "$HOME"/* ]]; then
+      omarchy-launch-editor "$path"
+      MSG="Editando: $path"
+    else
+      MSG="Unidad del sistema (no editable): $path"
+    fi
+    ;;
+  xdg)
+    if [[ ! -e $userf && -e $sysf ]]; then
+      cp "$sysf" "$userf"
+      MSG="Creada copia de usuario para editar: $clave"
+    fi
+    [[ -e $userf ]] || { MSG="No existe $clave"; return; }
+    omarchy-launch-editor "$userf"
+    MSG="Editando: $userf"
+    ;;
+  lua)
+    omarchy-launch-editor "$LUA_FILE"
+    MSG="Editando: $LUA_FILE"
+    ;;
+  esac
+}
+
+action_delete() { # $1 = fuente, $2 = clave, $3 = nombre
+  local fuente="$1" clave="$2" nombre="$3" a
+  case "$fuente" in
+  systemd) MSG="No se elimina un servicio — usa ENTER para deshabilitarlo" ;;
+  lua) MSG="No se elimina la línea — usa ENTER para comentarla" ;;
+  xdg)
+    if [[ ! -e $AUTO_DIR/$clave ]]; then
+      MSG="Entrada del sistema — usa ENTER para deshabilitarla"
+      return
+    fi
+    read -r -p "¿Eliminar «$nombre»? (s/N) " a
+    [[ $a == [sS] ]] || { MSG="Cancelado"; return; }
+    rm -f "$AUTO_DIR/$clave"
+    MSG="Eliminada: $clave"
+    xdg_apply "$clave"
+    ;;
+  esac
+}
+
+action_add() {
+  local aname acmd slug f
+  read -r -p $'\nNombre de la app: ' aname
+  [[ -n $aname ]] || { MSG="Cancelado"; return; }
+  read -r -p 'Comando a ejecutar: ' acmd
+  [[ -n $acmd ]] || { MSG="Cancelado"; return; }
+  slug=$(tr '[:upper:] ' '[:lower:]-' <<<"$aname" | tr -cd 'a-z0-9._-')
+  [[ -n $slug ]] || slug="app-$(date +%s)"
+  f="$AUTO_DIR/$slug.desktop"
+  if [[ -e $f ]]; then MSG="Ya existe: $slug.desktop"; return; fi
+  mkdir -p "$AUTO_DIR"
+  cat >"$f" <<EOF
+[Desktop Entry]
+Type=Application
+Name=$aname
+Exec=$acmd
+Hidden=false
+EOF
+  xdg_apply "$slug.desktop"
+  MSG="Añadido: $slug.desktop"
+}
+
+main() {
+  local HDR="ENTER alternar · CTRL-R ejecutar ahora · CTRL-E editar · CTRL-N añadir · CTRL-D eliminar · ESC salir"
+  local out rc key sel idx estado fuente nombre clave
+  local -a records
+  while true; do
+    mapfile -t records < <(gen_records)
+    if ((${#records[@]} == 0)); then
+      echo "No hay entradas de arranque que mostrar."
+      break
+    fi
+    out=$(printf '%s\n' "${records[@]}" | fzf \
+      --delimiter='|' --with-nth=2,3,4,5 \
+      --prompt='Arranque ▸ ' \
+      --header="$HDR${MSG:+ │ $MSG}" \
+      --expect=ctrl-r,ctrl-e,ctrl-n,ctrl-d)
+    rc=$?
+    ((rc == 130 || rc == 2)) && break
+    ((rc != 0)) && { MSG=""; continue; }
+    key=$(printf '%s\n' "$out" | sed -n 1p)
+    if [[ $key == ctrl-n ]]; then
+      action_add
+      continue
+    fi
+    sel=$(printf '%s\n' "$out" | sed -n 2p)
+    [[ -z $sel ]] && { MSG=""; continue; }
+    IFS='|' read -r idx estado fuente nombre clave <<<"$sel"
+    case "$key" in
+    "") action_toggle "$estado" "$fuente" "$clave" ;;
+    ctrl-r) action_run "$fuente" "$clave" ;;
+    ctrl-e) action_edit "$fuente" "$clave" ;;
+    ctrl-d) action_delete "$fuente" "$clave" "$nombre" ;;
+    esac
+  done
+  [[ -n $MSG ]] && printf '%s\n' "$MSG"
+}
+
+case "${1:-}" in
+--list)
+  gen_records | awk -F'|' '{ printf "%-2s %-14s %-8s %s\n", $1, $2, $3, $4 }'
+  ;;
+"")
+  main
+  ;;
+*)
+  echo "Uso: startup-manager [--list]" >&2
+  exit 2
+  ;;
+esac

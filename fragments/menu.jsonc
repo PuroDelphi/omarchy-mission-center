@@ -1,0 +1,8 @@
+// omarchy-mission-center — entradas del menú del sistema
+//
+// Añadir este bloque DENTRO del objeto raíz de:
+//   ~/.config/omarchy/extensions/omarchy-menu.jsonc
+//
+// No dejar coma final en la última entrada si cierras el objeto justo después.
+"system.tasks": {"icon":"󰒓","label":"Task Manager","aliases":["task manager","tareas","gestor de tareas","procesos"],"action":"uwsm-app -- missioncenter"},
+"system.startup": {"icon":"󰒒","label":"Startup","aliases":["startup","inicio","arranque"],"action":"omarchy-launch-tui $HOME/.local/bin/startup-manager"}
